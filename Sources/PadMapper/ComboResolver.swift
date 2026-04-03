@@ -14,14 +14,14 @@ final class ComboResolver {
         var activePhysicalKeys: [String: Date] = [:]
         var activeLogicalKeys: [String: PressedKeyState] = [:]
         var firedRuleIDs: Set<String> = []
-        var pendingSingleRuleDeadlines: [String: Date] = [:]
+        var cooldownUntilByRuleID: [String: Date] = [:]
         var outputLog: [String] = []
     }
 
     private var state = State()
 
     var pendingSingleRuleDeadlines: [String: Date] {
-        state.pendingSingleRuleDeadlines
+        [:]
     }
 
     func process(event: InputEvent, profile: DeviceProfile) -> ComboResolverOutcome {
@@ -43,7 +43,10 @@ final class ComboResolver {
 
     func flushPendingSingles(profile: DeviceProfile, now: Date) -> ComboResolverOutcome {
         cleanupState(profile: profile)
-        return evaluate(profile: profile, now: now)
+        return ComboResolverOutcome(
+            triggeredMatches: [],
+            snapshot: snapshot(candidateRuleIDs: [], winningRuleID: nil)
+        )
     }
 
     func appendLog(_ message: String, maxCount: Int = 12) -> DebugSnapshot {
@@ -62,63 +65,43 @@ final class ComboResolver {
                 return false
             }
             let activeKeys = activeKeySet(for: rule.triggerInputMode)
-            return Set(rule.triggerKeys).isSubset(of: activeKeys)
+            return !Set(rule.triggerKeys).isDisjoint(with: activeKeys)
         }
 
-        state.pendingSingleRuleDeadlines = state.pendingSingleRuleDeadlines.filter { ruleID, _ in
-            guard let rule = enabledRules.first(where: { $0.id == ruleID }) else {
+        state.cooldownUntilByRuleID = state.cooldownUntilByRuleID.filter { ruleID, deadline in
+            guard enabledRules.contains(where: { $0.id == ruleID }) else {
                 return false
             }
-            let activeKeys = activeKeySet(for: rule.triggerInputMode)
-            return Set(rule.triggerKeys).isSubset(of: activeKeys)
+            return deadline.timeIntervalSinceNow > -1
         }
     }
 
     private func evaluate(profile: DeviceProfile, now: Date) -> ComboResolverOutcome {
         let enabledRules = profile.rules.filter(\.enabled)
 
-        for rule in enabledRules where rule.triggerType == .single {
-            guard let keyID = rule.triggerKeys.first else { continue }
-            guard let pressedAt = keyPressedAt(keyID: keyID, inputMode: rule.triggerInputMode) else {
-                state.pendingSingleRuleDeadlines.removeValue(forKey: rule.id)
-                continue
-            }
-
-            if hasConflictingSuperset(singleRule: rule, rules: enabledRules) {
-                let deadline = pressedAt.addingTimeInterval(Double(rule.triggerWindowMs) / 1000)
-                state.pendingSingleRuleDeadlines[rule.id] = deadline
-            } else {
-                state.pendingSingleRuleDeadlines.removeValue(forKey: rule.id)
-            }
-        }
-
         let candidateRules = enabledRules.filter { rule in
             let activeKeys = activeKeySet(for: rule.triggerInputMode)
-            return Set(rule.triggerKeys).isSubset(of: activeKeys) && isWindowSatisfied(for: rule)
+            switch rule.triggerType {
+            case .single:
+                guard let key = rule.triggerKeys.first else { return false }
+                return activeKeys.contains(key)
+            case .combo:
+                return !Set(rule.triggerKeys).isDisjoint(with: activeKeys)
+            }
         }.map(RuleCandidate.init)
 
         let winner = candidateRules
-            .filter { candidate in
-                if candidate.rule.triggerType == .single, let deadline = state.pendingSingleRuleDeadlines[candidate.rule.id] {
-                    return now >= deadline
-                }
-                return true
-            }
             .sorted(by: candidateSort)
             .first
 
         var triggeredMatches: [TriggerMatch] = []
 
-        if let winner, !state.firedRuleIDs.contains(winner.rule.id) {
+        if let winner,
+           !state.firedRuleIDs.contains(winner.rule.id),
+           canTrigger(rule: winner.rule, now: now) {
             state.firedRuleIDs.insert(winner.rule.id)
-
-            if winner.rule.triggerType == .combo {
-                state.pendingSingleRuleDeadlines = state.pendingSingleRuleDeadlines.filter { ruleID, _ in
-                    guard let rule = enabledRules.first(where: { $0.id == ruleID }) else {
-                        return false
-                    }
-                    return Set(rule.triggerKeys).isDisjoint(with: winner.rule.triggerKeys)
-                }
+            if winner.rule.triggerType == .combo || winner.rule.triggerKeys.count > 1 {
+                state.cooldownUntilByRuleID[winner.rule.id] = now.addingTimeInterval(Double(winner.rule.triggerWindowMs) / 1000)
             }
 
             triggeredMatches.append(
@@ -147,7 +130,7 @@ final class ComboResolver {
             candidateRuleIDs: candidateRuleIDs,
             winningRuleID: winningRuleID,
             firedRuleIDs: state.firedRuleIDs.sorted(),
-            pendingSingleRuleIDs: state.pendingSingleRuleDeadlines.keys.sorted(),
+            pendingSingleRuleIDs: [],
             outputLog: state.outputLog
         )
     }
@@ -156,29 +139,14 @@ final class ComboResolver {
         profile.layout.first(where: { $0.calibrateBinding?.physicalKeyID == physicalKeyID })?.id
     }
 
-    private func hasConflictingSuperset(singleRule: BindingRule, rules: [BindingRule]) -> Bool {
-        let singleKeys = Set(singleRule.triggerKeys)
-        return rules.contains { rule in
-            guard rule.id != singleRule.id else { return false }
-            guard rule.triggerInputMode == singleRule.triggerInputMode else { return false }
-            let triggerKeys = Set(rule.triggerKeys)
-            return triggerKeys.count > singleKeys.count && singleKeys.isSubset(of: triggerKeys)
+    private func canTrigger(rule: BindingRule, now: Date) -> Bool {
+        guard rule.triggerType == .combo || rule.triggerKeys.count > 1 else {
+            return true
         }
-    }
-
-    private func isWindowSatisfied(for rule: BindingRule) -> Bool {
-        guard let firstKeyID = rule.triggerKeys.first, let firstPressedAt = keyPressedAt(keyID: firstKeyID, inputMode: rule.triggerInputMode) else {
-            return false
+        guard let cooldownUntil = state.cooldownUntilByRuleID[rule.id] else {
+            return true
         }
-
-        let timestamps = rule.triggerKeys.compactMap { keyPressedAt(keyID: $0, inputMode: rule.triggerInputMode) }.sorted()
-        guard timestamps.count == rule.triggerKeys.count else {
-            return false
-        }
-
-        let lastTimestamp = timestamps.last ?? firstPressedAt
-        let diff = lastTimestamp.timeIntervalSince(timestamps.first ?? firstPressedAt)
-        return diff * 1000 <= Double(rule.triggerWindowMs)
+        return now >= cooldownUntil
     }
 
     private func activeKeySet(for inputMode: TriggerInputMode) -> Set<String> {

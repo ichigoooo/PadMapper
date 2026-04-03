@@ -408,6 +408,58 @@ struct ActionExecutionResult: Sendable {
     let message: String
 }
 
+struct RuntimeFeedbackEntry: Identifiable, Hashable, Sendable {
+    let id: String
+    let timestamp: Date
+    let message: String
+}
+
+enum NoticeLevel: String, Hashable, Sendable {
+    case info
+    case success
+    case warning
+    case error
+}
+
+struct PrimaryNotice: Hashable, Sendable {
+    var level: NoticeLevel
+    var title: String
+    var message: String
+    var details: String?
+
+    var fullText: String {
+        [message, details].compactMap { $0?.nilIfEmpty }.joined(separator: " ")
+    }
+}
+
+enum WorkflowStep: String, Hashable, Sendable {
+    case waitingForKeys
+    case readyToPin
+    case configureGroup
+
+    var title: String {
+        switch self {
+        case .waitingForKeys:
+            return "等待按键"
+        case .readyToPin:
+            return "可以固定"
+        case .configureGroup:
+            return "配置动作"
+        }
+    }
+
+    var summary: String {
+        switch self {
+        case .waitingForKeys:
+            return "先在目标小键盘上按下想归为一组的键。"
+        case .readyToPin:
+            return "当前已经识别到按键，可以直接固定成按键组。"
+        case .configureGroup:
+            return "按键组已经就绪，下一步在右侧配置动作并确认。"
+        }
+    }
+}
+
 extension DeviceMatch {
     func matches(device: ManagedInputDevice) -> Bool {
         if transport == "mock" || device.isMock {
@@ -423,5 +475,11 @@ extension DeviceMatch {
         }
 
         return true
+    }
+}
+
+private extension String {
+    var nilIfEmpty: String? {
+        isEmpty ? nil : self
     }
 }

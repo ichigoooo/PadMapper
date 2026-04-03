@@ -15,6 +15,9 @@ final class AppModel {
     var isCalibrationMode: Bool
     var statusMessage: String
     var debugSnapshot: DebugSnapshot
+    var feedbackEntries: [RuntimeFeedbackEntry]
+    var primaryNotice: PrimaryNotice
+    var lastConfigSavedAt: Date?
 
     @ObservationIgnored private let inputService: InputDeviceService
     @ObservationIgnored private let profileStore: ProfileStore
@@ -23,8 +26,8 @@ final class AppModel {
     @ObservationIgnored private var eventTask: Task<Void, Never>?
     @ObservationIgnored private var devicesTask: Task<Void, Never>?
     @ObservationIgnored private var flushTasks: [String: Task<Void, Never>] = [:]
+    @ObservationIgnored private var feedbackDismissTasks: [String: Task<Void, Never>] = [:]
     @ObservationIgnored private var ignoredCalibrationPhysicalKeys: Set<String> = []
-    @ObservationIgnored private var lastUnmappedNoticeAt: Date?
 
     static func bootstrap() -> AppModel {
         let inputService = IOHIDInputDeviceService()
@@ -35,7 +38,6 @@ final class AppModel {
 
     init(inputService: InputDeviceService, profileStore: ProfileStore, actionExecutor: ActionExecutor) {
         let loadedProfile = (try? profileStore.loadProfile()) ?? DeviceProfile.defaultProfile()
-        let initialRule = loadedProfile.rules.first(where: { $0.triggerInputMode == .physical }) ?? loadedProfile.rules.first
         self.inputService = inputService
         self.profileStore = profileStore
         self.actionExecutor = actionExecutor
@@ -44,12 +46,20 @@ final class AppModel {
         self.inputSourceMode = .none
         self.profile = loadedProfile
         self.selectedKeyIDs = []
-        self.selectedFunctionUnitID = initialRule?.functionUnitId ?? loadedProfile.functionUnits.first?.id
-        self.selectedRuleID = initialRule?.id
+        self.selectedFunctionUnitID = nil
+        self.selectedRuleID = nil
         self.awaitingCalibrationKeyID = nil
         self.isCalibrationMode = false
-        self.statusMessage = "按住小键盘上的若干键后，点击“固定当前按键组合”即可创建规则。"
+        self.statusMessage = "把多个键归为同一组；组内任意一个键按下都会触发，短时间内多个键只算一次。"
         self.debugSnapshot = .empty
+        self.feedbackEntries = []
+        self.primaryNotice = PrimaryNotice(
+            level: .info,
+            title: "开始使用",
+            message: "把多个键归为同一组；组内任意一个键按下都会触发，短时间内多个键只算一次。",
+            details: "先按键，再固定，最后去右侧确认动作。"
+        )
+        self.lastConfigSavedAt = nil
 
         restorePreferredDeviceIfNeeded(from: devices, announce: false)
         startEventLoop()
@@ -60,6 +70,7 @@ final class AppModel {
         eventTask?.cancel()
         devicesTask?.cancel()
         flushTasks.values.forEach { $0.cancel() }
+        feedbackDismissTasks.values.forEach { $0.cancel() }
     }
 
     var permissionState: AccessibilityPermissionState {
@@ -126,6 +137,46 @@ final class AppModel {
         selectedRuleFunctionUnit?.actions.first?.mediaKey ?? .playPause
     }
 
+    var selectedRuleDisplayName: String {
+        selectedRuleFunctionUnit?.name.nilIfEmpty ?? "未命名按键组"
+    }
+
+    var workflowStep: WorkflowStep {
+        if !debugSnapshot.activePhysicalKeys.isEmpty {
+            return .readyToPin
+        }
+        if lastConfigSavedAt != nil {
+            return .configureGroup
+        }
+        if let selectedRule, selectedRule.triggerInputMode == .physical {
+            return .configureGroup
+        }
+        return .waitingForKeys
+    }
+
+    var currentActionSummaryText: String {
+        guard let action = selectedRuleFunctionUnit?.actions.first else {
+            return "还没有配置动作"
+        }
+        switch action.type {
+        case .shortcut:
+            guard let shortcut = action.shortcut else {
+                return "快捷键未配置"
+            }
+            return KeyCodeMapper.render(shortcut: shortcut)
+        case .mediaKey:
+            return action.mediaKey?.title ?? "多媒体键未配置"
+        }
+    }
+
+    var shouldShowPermissionReminder: Bool {
+        permissionState != .authorized
+    }
+
+    var shouldShowMockReminder: Bool {
+        inputSourceMode == .mock
+    }
+
     var selectedKeysSummaryText: String {
         let keys = orderedSelectedKeys
         guard !keys.isEmpty else {
@@ -137,7 +188,7 @@ final class AppModel {
             return "当前选中 1 个键：\(key.label)。当前绑定：\(bindingText)。"
         }
 
-        return "当前选中 \(keys.count) 个键：\(keys.map(\.label).joined(separator: " + "))。现在可以直接创建一个多键组合规则。"
+        return "当前选中 \(keys.count) 个键：\(keys.map(\.label).joined(separator: " + "))。现在可以直接创建一个多键规则。"
     }
 
     func refreshPermissionState() {
@@ -146,7 +197,12 @@ final class AppModel {
 
     func requestAccessibilityPermission() {
         actionExecutor.requestAccessibilityPermission()
-        statusMessage = "已请求打开辅助功能授权提示。"
+        presentPrimaryNotice(
+            level: .info,
+            title: "已请求权限",
+            message: "系统已弹出辅助功能授权提示。",
+            details: "完成授权后，这些按键组才能真正向系统发出快捷键。"
+        )
     }
 
     func toggleSelection(for keyID: String) {
@@ -161,6 +217,22 @@ final class AppModel {
         selectedKeyIDs.removeAll()
     }
 
+    func clearWorkflowState() {
+        selectedKeyIDs.removeAll()
+        selectedRuleID = nil
+        selectedFunctionUnitID = nil
+        awaitingCalibrationKeyID = nil
+        isCalibrationMode = false
+        inputService.endCalibration()
+        lastConfigSavedAt = nil
+        presentPrimaryNotice(
+            level: .info,
+            title: "状态已清空",
+            message: "当前进度已经重置。",
+            details: "现在可以从第一步重新开始：先按键，再固定按键组。"
+        )
+    }
+
     func selectInputDevice(_ deviceID: String) {
         guard let device = devices.first(where: { $0.id == deviceID }) else { return }
         inputService.setActiveDevice(device.id)
@@ -173,7 +245,21 @@ final class AppModel {
         mutateProfile { profile in
             profile.deviceMatch = device.deviceMatch
         }
-        statusMessage = device.isMock ? "已切换到测试模式。" : "已选择真实设备：\(device.name)。当前为监听模式。"
+        if device.isMock {
+            presentPrimaryNotice(
+                level: .info,
+                title: "当前是测试模式",
+                message: "还没有使用真实设备输入。",
+                details: "你可以先继续配置按键组，之后再切回真实设备验证。"
+            )
+        } else {
+            presentPrimaryNotice(
+                level: .success,
+                title: "已连接目标设备",
+                message: "当前正在监听：\(device.name)。",
+                details: "现在可以按下想归组的键，然后固定成按键组。"
+            )
+        }
     }
 
     func beginCalibrationForSelectedKey() {
@@ -189,14 +275,24 @@ final class AppModel {
         inputService.beginCalibration()
         awaitingCalibrationKeyID = key.id
         isCalibrationMode = true
-        statusMessage = "正在校准 \(key.label)。请在\(activeDevice.isMock ? "测试区" : "真实设备")上按下目标物理键。"
+        presentPrimaryNotice(
+            level: .info,
+            title: "正在校准",
+            message: "请为 \(key.label) 按下目标物理键。",
+            details: activeDevice.isMock ? "当前会从测试面板接收按键。" : "当前会从真实设备接收按键。"
+        )
     }
 
     func cancelCalibration() {
         awaitingCalibrationKeyID = nil
         isCalibrationMode = false
         inputService.endCalibration()
-        statusMessage = "已取消校准。"
+        presentPrimaryNotice(
+            level: .warning,
+            title: "已取消校准",
+            message: "当前没有保存新的校准结果。",
+            details: nil
+        )
     }
 
     func setCalibrationTargetKey(_ keyID: String?) {
@@ -206,7 +302,13 @@ final class AppModel {
     func pinCurrentPressedCombo() {
         let triggerKeys = normalizedPhysicalKeys(debugSnapshot.activePhysicalKeys)
         guard !triggerKeys.isEmpty else {
-            statusMessage = "先在小键盘上按住至少 1 个键，再点“固定当前按键组合”。"
+            presentPrimaryNotice(
+                level: .warning,
+                title: "还没有按键",
+                message: "请先按下想归组的键，再点击“固定当前按键组”。",
+                details: nil,
+                alsoLog: true
+            )
             return
         }
 
@@ -214,13 +316,31 @@ final class AppModel {
             rule.triggerInputMode == .physical && normalizedPhysicalKeys(rule.triggerKeys) == triggerKeys
         }) {
             selectRule(existing.id)
-            statusMessage = "这个组合已经存在，已帮你定位到它。"
+            presentPrimaryNotice(
+                level: .warning,
+                title: "按键组已存在",
+                message: "这组按键已经保存过了。",
+                details: "我已经帮你定位到现有的按键组。",
+                alsoLog: true
+            )
+            return
+        }
+
+        if let conflict = findPinnedRuleConflict(for: triggerKeys) {
+            selectRule(conflict.rule.id)
+            presentPrimaryNotice(
+                level: .error,
+                title: "按键组冲突",
+                message: "有按键和已有组合冲突，请确认后重新设置。",
+                details: "冲突按键：\(conflict.keyID)，已有组合：\(comboDisplayName(for: conflict.rule))。",
+                alsoLog: true
+            )
             return
         }
 
         let functionUnit = FunctionUnit(
             id: UUID().uuidString,
-            name: "组合 \(pinnedPhysicalRules.count + 1)",
+            name: "按键组 \(pinnedPhysicalRules.count + 1)",
             description: "由物理键码固定创建",
             actions: [.shortcut(modifiers: [.command], key: "y")],
             enabled: true
@@ -244,7 +364,13 @@ final class AppModel {
         }
         selectedFunctionUnitID = functionUnit.id
         selectedRuleID = rule.id
-        statusMessage = "已固定组合：\(triggerKeys.joined(separator: " + "))。现在可以配置它的功能。"
+        presentPrimaryNotice(
+            level: .success,
+            title: "已固定按键组",
+            message: "按键组已经保存成功。",
+            details: "接下来请在右侧为它设置动作并点击确认。",
+            alsoLog: true
+        )
     }
 
     func createRuleFromSelection() {
@@ -274,7 +400,7 @@ final class AppModel {
             profile.rules.append(rule)
         }
         selectedRuleID = rule.id
-        statusMessage = "已创建\(dedupedKeys.count == 1 ? "单键" : "多键组合")规则。"
+        statusMessage = "已创建\(dedupedKeys.count == 1 ? "单键" : "多键")规则。"
     }
 
     func createDemoComboRule() {
@@ -292,7 +418,7 @@ final class AppModel {
         })
         if let existingRule {
             selectedRuleID = existingRule.id
-            statusMessage = "示例三键组合已经存在。按 P00 + P01 + P02 就能试。"
+            statusMessage = "示例三键按键组已经存在。按 P00 + P01 + P02 就能试。"
             return
         }
 
@@ -311,7 +437,7 @@ final class AppModel {
             profile.rules.append(rule)
         }
         selectedRuleID = rule.id
-        statusMessage = "已创建示例三键组合。现在可以在测试区或真实设备上触发它。"
+        statusMessage = "已创建示例三键按键组。现在可以在测试区或真实设备上触发它。"
     }
 
     func selectRule(_ id: String) {
@@ -341,7 +467,49 @@ final class AppModel {
         let nextRule = pinnedPhysicalRules.first ?? profile.rules.first
         self.selectedRuleID = nextRule?.id
         self.selectedFunctionUnitID = nextRule?.functionUnitId ?? profile.functionUnits.first?.id
-        statusMessage = "已删除当前组合。"
+        presentPrimaryNotice(
+            level: .warning,
+            title: "已删除按键组",
+            message: "当前选中的按键组已经移除。",
+            details: nil,
+            alsoLog: true
+        )
+    }
+
+    func confirmSelectedGroupConfiguration(
+        name: String,
+        actionType: OutputActionType,
+        shortcutKey: String,
+        modifiers: [ShortcutModifier],
+        mediaKey: MediaKeyType
+    ) {
+        guard let functionUnitID = selectedRuleFunctionUnit?.id ?? selectedFunctionUnitID else { return }
+        let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedName = trimmedName.nilIfEmpty ?? "未命名按键组"
+        let normalizedShortcutKey = shortcutKey.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty ?? "y"
+
+        mutateFunctionUnit(functionUnitID: functionUnitID) { unit in
+            unit.name = normalizedName
+            if unit.actions.isEmpty {
+                unit.actions = [.shortcut(modifiers: [.command], key: "y")]
+            }
+            let actionID = unit.actions[0].id
+            switch actionType {
+            case .shortcut:
+                unit.actions[0] = .shortcut(id: actionID, modifiers: modifiers.sorted { $0.rawValue < $1.rawValue }, key: normalizedShortcutKey)
+            case .mediaKey:
+                unit.actions[0] = .mediaKey(id: actionID, key: mediaKey)
+            }
+        }
+
+        lastConfigSavedAt = Date()
+        presentPrimaryNotice(
+            level: .success,
+            title: "已保存按键组配置",
+            message: "当前按键组的名称和动作已经确认保存。",
+            details: "现在可以直接按下组内任意一个键进行测试。",
+            alsoLog: true
+        )
     }
 
     func updateFunctionUnitName(_ name: String) {
@@ -448,7 +616,12 @@ final class AppModel {
             activeDeviceID = nil
             inputSourceMode = .none
             if previousActiveDeviceID != ManagedInputDevice.mockPad.id {
-                statusMessage = "之前选择的真实设备已断开连接。你可以重新选择它，或先切回测试模式。"
+                presentPrimaryNotice(
+                    level: .warning,
+                    title: "设备已断开",
+                    message: "之前选择的真实设备已经断开。",
+                    details: "你可以重新选择它，或先切回测试模式。"
+                )
             }
         }
 
@@ -456,7 +629,12 @@ final class AppModel {
         restorePreferredDeviceIfNeeded(from: updatedDevices, announce: false)
 
         if hadActiveBeforeRestore != activeDeviceID, let activeDevice, !activeDevice.isMock {
-            statusMessage = "已切到真实设备：\(activeDevice.name)。现在按住几个键后点“固定当前按键组合”即可。"
+            presentPrimaryNotice(
+                level: .success,
+                title: "已切换到真实设备",
+                message: "当前设备：\(activeDevice.name)。",
+                details: "现在按下想归组的键，然后点击“固定当前按键组”。"
+            )
         }
     }
 
@@ -473,7 +651,12 @@ final class AppModel {
             activeDeviceID = matchedDevice.id
             inputSourceMode = .hid
             if announce {
-                statusMessage = "已自动恢复目标设备：\(matchedDevice.name)。"
+                presentPrimaryNotice(
+                    level: .success,
+                    title: "已恢复目标设备",
+                    message: "当前设备：\(matchedDevice.name)。",
+                    details: nil
+                )
             }
             return
         }
@@ -484,7 +667,12 @@ final class AppModel {
             activeDeviceID = firstRealDevice.id
             inputSourceMode = .hid
             if announce {
-                statusMessage = "已自动切换到真实设备：\(firstRealDevice.name)。如需回退，可在“更多设置”切回测试模式。"
+                presentPrimaryNotice(
+                    level: .success,
+                    title: "已自动切换到真实设备",
+                    message: "当前设备：\(firstRealDevice.name)。",
+                    details: "如需回退，可在“更多设置”切回测试模式。"
+                )
             }
             return
         }
@@ -494,7 +682,12 @@ final class AppModel {
             activeDeviceID = ManagedInputDevice.mockPad.id
             inputSourceMode = .mock
             if announce {
-                statusMessage = "已切回测试模式。"
+                presentPrimaryNotice(
+                    level: .info,
+                    title: "已切回测试模式",
+                    message: "当前没有启用真实设备输入。",
+                    details: nil
+                )
             }
         }
     }
@@ -527,7 +720,6 @@ final class AppModel {
         let outcome = resolver.process(event: event, profile: profile)
         debugSnapshot = outcome.snapshot
         rescheduleFlushTasks()
-        maybeNotifyUncalibratedInput(for: event)
         perform(matches: outcome.triggeredMatches)
     }
 
@@ -539,7 +731,13 @@ final class AppModel {
             }
             let result = actionExecutor.execute(functionUnit: functionUnit)
             debugSnapshot = resolver.appendLog(result.message)
-            statusMessage = result.message
+            presentPrimaryNotice(
+                level: result.usedLiveExecution ? .success : .warning,
+                title: result.usedLiveExecution ? "已发送动作" : "动作已记录",
+                message: result.message,
+                details: nil,
+                alsoLog: true
+            )
         }
     }
 
@@ -574,6 +772,12 @@ final class AppModel {
             $0.id != logicalKeyID && $0.calibrateBinding?.deviceId == deviceID && $0.calibrateBinding?.physicalKeyID == physicalKeyID
         }) {
             statusMessage = "绑定失败：\(physicalKeyID) 已被 \(conflictKey.label) 使用。"
+            primaryNotice = PrimaryNotice(
+                level: .error,
+                title: "校准失败",
+                message: "这个物理键已经绑定到其他逻辑键。",
+                details: "冲突按键：\(physicalKeyID)，已有位置：\(conflictKey.label)。"
+            )
             return false
         }
 
@@ -586,18 +790,13 @@ final class AppModel {
                 elementCookie: elementCookie
             )
         }
-        statusMessage = "已将 \(logicalKeyID) 绑定到 \(physicalKeyID)。"
+        presentPrimaryNotice(
+            level: .success,
+            title: "校准完成",
+            message: "已完成逻辑键和物理键的绑定。",
+            details: "当前位置：\(logicalKeyID)，物理键：\(physicalKeyID)。"
+        )
         return true
-    }
-
-    private func maybeNotifyUncalibratedInput(for event: InputEvent) {
-        guard inputSourceMode == .hid, event.isPressed else { return }
-        let now = Date()
-        if let last = lastUnmappedNoticeAt, now.timeIntervalSince(last) < 1.2 {
-            return
-        }
-        lastUnmappedNoticeAt = now
-        statusMessage = "已识别到按键码 \(event.physicalKeyID)。保持按住后点“固定当前按键组合”即可保存。"
     }
 
     private func mutateFunctionUnit(functionUnitID: String, mutation: (inout FunctionUnit) -> Void) {
@@ -621,7 +820,13 @@ final class AppModel {
         do {
             try profileStore.saveProfile(updated)
         } catch {
-            statusMessage = "保存失败：\(error.localizedDescription)"
+            presentPrimaryNotice(
+                level: .error,
+                title: "保存失败",
+                message: "配置没有成功写入本地文件。",
+                details: error.localizedDescription,
+                alsoLog: true
+            )
         }
     }
 
@@ -644,6 +849,53 @@ final class AppModel {
 
     private func normalizedPhysicalKeys(_ keys: [String]) -> [String] {
         Array(NSOrderedSet(array: keys.sorted())) as? [String] ?? keys.sorted()
+    }
+
+    private func findPinnedRuleConflict(for triggerKeys: [String]) -> (rule: BindingRule, keyID: String)? {
+        let requestedKeys = Set(triggerKeys)
+        for rule in pinnedPhysicalRules {
+            let overlappingKeys = normalizedPhysicalKeys(Array(requestedKeys.intersection(rule.triggerKeys)))
+            if let keyID = overlappingKeys.first {
+                return (rule, keyID)
+            }
+        }
+        return nil
+    }
+
+    private func comboDisplayName(for rule: BindingRule) -> String {
+        profile.functionUnits
+            .first(where: { $0.id == rule.functionUnitId })?
+            .name
+            .nilIfEmpty ?? "未命名按键组"
+    }
+
+    private func presentPrimaryNotice(
+        level: NoticeLevel,
+        title: String,
+        message: String,
+        details: String?,
+        alsoLog: Bool = false
+    ) {
+        primaryNotice = PrimaryNotice(level: level, title: title, message: message, details: details)
+        statusMessage = primaryNotice.fullText
+        if alsoLog {
+            appendFeedbackMessage([title, primaryNotice.fullText].joined(separator: " · "))
+        }
+    }
+
+    private func appendFeedbackMessage(_ message: String) {
+        let entry = RuntimeFeedbackEntry(id: UUID().uuidString, timestamp: Date(), message: message)
+        feedbackEntries.append(entry)
+
+        feedbackDismissTasks[entry.id]?.cancel()
+        feedbackDismissTasks[entry.id] = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(5))
+            await MainActor.run {
+                guard let self else { return }
+                self.feedbackEntries.removeAll { $0.id == entry.id }
+                self.feedbackDismissTasks.removeValue(forKey: entry.id)
+            }
+        }
     }
 }
 

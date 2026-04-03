@@ -20,23 +20,15 @@ import Testing
     #expect(third.triggeredMatches.map(\.ruleID) == ["single"])
 }
 
-@Test func tripleComboRequiresWindow() async throws {
+@Test func comboGroupFiresFromAnyMemberKey() async throws {
     let profile = makeProfile(rules: [
         BindingRule(id: "combo", triggerKeys: ["K00", "K01", "K02"], triggerType: .combo, triggerWindowMs: 80, suppressIndividualKeys: true, functionUnitId: "unit", enabled: true, priority: 100)
     ])
     let resolver = ComboResolver()
     let now = Date()
 
-    _ = resolver.process(event: makeEvent("P00", true, now), profile: profile)
-    _ = resolver.process(event: makeEvent("P01", true, now.addingTimeInterval(0.02)), profile: profile)
-    let withinWindow = resolver.process(event: makeEvent("P02", true, now.addingTimeInterval(0.05)), profile: profile)
-    #expect(withinWindow.triggeredMatches.map(\.ruleID) == ["combo"])
-
-    let lateResolver = ComboResolver()
-    _ = lateResolver.process(event: makeEvent("P00", true, now), profile: profile)
-    _ = lateResolver.process(event: makeEvent("P01", true, now.addingTimeInterval(0.04)), profile: profile)
-    let outsideWindow = lateResolver.process(event: makeEvent("P02", true, now.addingTimeInterval(0.12)), profile: profile)
-    #expect(outsideWindow.triggeredMatches.isEmpty)
+    let outcome = resolver.process(event: makeEvent("P01", true, now), profile: profile)
+    #expect(outcome.triggeredMatches.map(\.ruleID) == ["combo"])
 }
 
 @Test func longestMatchWinsOverSubset() async throws {
@@ -47,9 +39,7 @@ import Testing
     let resolver = ComboResolver()
     let now = Date()
 
-    _ = resolver.process(event: makeEvent("P00", true, now), profile: profile)
-    _ = resolver.process(event: makeEvent("P01", true, now.addingTimeInterval(0.01)), profile: profile)
-    let outcome = resolver.process(event: makeEvent("P02", true, now.addingTimeInterval(0.02)), profile: profile)
+    let outcome = resolver.process(event: makeEvent("P00", true, now), profile: profile)
     #expect(outcome.triggeredMatches.map(\.ruleID) == ["combo"])
 }
 
@@ -61,24 +51,27 @@ import Testing
     let resolver = ComboResolver()
     let now = Date()
 
-    _ = resolver.process(event: makeEvent("P00", true, now), profile: profile)
-    let outcome = resolver.process(event: makeEvent("P01", true, now.addingTimeInterval(0.01)), profile: profile)
+    let outcome = resolver.process(event: makeEvent("P00", true, now), profile: profile)
     #expect(outcome.triggeredMatches.map(\.ruleID) == ["rule-b"])
 }
 
-@Test func sharedSingleWaitsThenFiresIfComboNeverForms() async throws {
+@Test func comboGroupDoesNotRepeatWithinBurstWindow() async throws {
     let profile = makeProfile(rules: [
-        BindingRule(id: "single", triggerKeys: ["K00"], triggerType: .single, triggerWindowMs: 80, suppressIndividualKeys: true, functionUnitId: "unit", enabled: true, priority: 100),
         BindingRule(id: "combo", triggerKeys: ["K00", "K01"], triggerType: .combo, triggerWindowMs: 80, suppressIndividualKeys: true, functionUnitId: "unit", enabled: true, priority: 100)
     ])
     let resolver = ComboResolver()
     let now = Date()
 
-    let initial = resolver.process(event: makeEvent("P00", true, now), profile: profile)
-    #expect(initial.triggeredMatches.isEmpty)
+    let first = resolver.process(event: makeEvent("P00", true, now), profile: profile)
+    #expect(first.triggeredMatches.map(\.ruleID) == ["combo"])
 
-    let flush = resolver.flushPendingSingles(profile: profile, now: now.addingTimeInterval(0.081))
-    #expect(flush.triggeredMatches.map(\.ruleID) == ["single"])
+    _ = resolver.process(event: makeEvent("P00", false, now.addingTimeInterval(0.01)), profile: profile)
+    let second = resolver.process(event: makeEvent("P01", true, now.addingTimeInterval(0.03)), profile: profile)
+    #expect(second.triggeredMatches.isEmpty)
+
+    _ = resolver.process(event: makeEvent("P01", false, now.addingTimeInterval(0.04)), profile: profile)
+    let third = resolver.process(event: makeEvent("P00", true, now.addingTimeInterval(0.10)), profile: profile)
+    #expect(third.triggeredMatches.map(\.ruleID) == ["combo"])
 }
 
 @Test func uncalibratedPhysicalKeyOnlyAppearsInDebug() async throws {
@@ -118,9 +111,7 @@ import Testing
 
     let resolver = ComboResolver()
     let now = Date()
-    _ = resolver.process(event: makeEvent("u7-4-c10", true, now), profile: profile)
-    _ = resolver.process(event: makeEvent("u7-5-c11", true, now.addingTimeInterval(0.02)), profile: profile)
-    let outcome = resolver.process(event: makeEvent("u7-6-c12", true, now.addingTimeInterval(0.04)), profile: profile)
+    let outcome = resolver.process(event: makeEvent("u7-4-c10", true, now), profile: profile)
 
     #expect(outcome.triggeredMatches.map(\.ruleID) == ["physical-combo"])
 }
